@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+
+contract AuctionController is IERC721Receiver {
+    address public seller;
+    // address public nftContract;
+    IERC721 public nft;
+
+    uint256 public tokenId;
+
+    // address public paymentToken; // address(0) 表示 ETH
+    IERC20 public bidToken; //ERC20 token for bidding (null is ETH)
+
+    // uint256 public reservePrice;
+    uint256 public startTime;
+    uint256 public endTime;
+
+    address public highestBidder;
+    // uint256 public highestBid;
+    uint256 public highestBidUSD; // in USD with 8 decimals
+
+    mapping(address => uint256) public bids;
+
+    bool public settled;
+
+    AggregatorV3Interface internal priceFeed;
+
+    address public factory; //deploy factory address
+
+    uint256 private _status;
+
+    event BidPlaced(address indexed bidder, uint256 amount, uint256 amountInUSD);
+    event AuctionEnded(address winner, uint256 winningBidUSD);
+    event AuctionCancelled();
+
+    modifier nonReentrant() {
+        require(_status == 1, "ReentrancyGuard: reentrant call");
+        _status = 1;
+        _;
+        _status = 0;
+    }
+
+    constructor(
+        address _nftContract,
+        uint256 _tokenId,
+        address _seller,
+        address _bidToken,
+        address _priceFeed,
+        uint256 _startTime,
+        uint256 _endTime
+    ) {
+        nft = IERC721(_nftContract);
+        tokenId = _tokenId;
+        seller = _seller;
+        bidToken = IERC20(_bidToken);
+        startTime = _startTime;
+        endTime = _endTime;
+
+        priceFeed = AggregatorV3Interface(_priceFeed);
+
+        factory = msg.sender; //factory address
+
+        _status = 0;
+    }
+
+    function getLastPrice() internal view returns (uint256) {
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        return uint256(price);
+    }
+
+    function ToUSD(uint256 amount) internal view returns (uint256) {
+        uint256 price = getLastPrice();
+        require(price > 0, "Invalid price");
+
+        uint256 decials = 10 ** priceFeed.decimals();
+
+        return (amount * price) / decials;
+    }
+
+    /// @dev Handles the receipt of an NFT
+    function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata data)
+        external
+        pure
+        override
+        returns (bytes4)
+    {
+        return this.onERC721Received.selector;
+    }
+
+    function bid(uint256 amount) external payable nonReentrant {
+        require(block.timestamp >= startTime, "Auction not started");
+        require(block.timestamp <= endTime, "Auction ended");
+        require(!settled, "Auction already settled");
+
+        uint256 bidAmount;
+        if (address(bidToken) == address(0)) {
+            // 用 ETH 出价
+            require(msg.value > 0, "ETH bid required");
+            bidAmount = msg.value;
+        } else {
+            // 用 ERC20 出价
+            require(amount > 0, "ERC20 bid required");
+            bidToken.transferFrom(msg.sender, address(this), amount);
+            bidAmount = amount;
+        }
+
+        uint256 bidInUSD = ToUSD(bidAmount);
+        require(bidInUSD > highestBidUSD, "Bid too low");
+
+        if (highestBidder != address(0)) {
+            if (address(bidToken) == address(0)) {
+                payable(highestBidder).transfer(bids[highestBidder]);
+            } else {
+                bidToken.transfer(highestBidder, bids[highestBidder]);
+            }
+        }
+
+        bids[msg.sender] = bidAmount;
+        highestBidder = msg.sender;
+        highestBidUSD = bidInUSD;
+
+        emit BidPlaced(msg.sender, amount, bidInUSD);
+    }
+
+    function endAuction() external nonReentrant {
+        require(block.timestamp >= endTime, "Auction not ended yet");
+        require(!settled, "Auction already settled");
+        require(highestBidder != address(0), "No bids placed");
+        settled = true;
+
+        nft.transferFrom(address(this), highestBidder, tokenId);
+
+        if (address(bidToken) == address(0)) {
+            payable(seller).transfer(bids[highestBidder]);
+        } else {
+            bidToken.transfer(seller, bids[highestBidder]);
+        }
+
+        emit AuctionEnded(highestBidder, highestBidUSD);
+    }
+
+    function cancelAuction() external nonReentrant {
+        require(msg.sender == seller, "Only seller");
+        require(highestBidder == address(0), "Can't cancel, bid exists");
+        require(!settled, "Already settled");
+        settled = true;
+
+        nft.safeTransferFrom(address(this), seller, tokenId);
+
+        emit AuctionCancelled();
+    }
+
+    receive() external payable {}
+}
