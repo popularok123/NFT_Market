@@ -4,12 +4,24 @@ pragma solidity ^0.8.28;
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {IRouterClient} from "@chainlink/contracts-ccip/contracts/interfaces/IRouterClient.sol";
 import {Client} from "@chainlink/contracts-ccip/contracts/libraries/Client.sol";
 import {IAuction} from "./IAuction.sol";
 
-contract AuctionController is IERC721Receiver, IAuction {
+contract AuctionController is
+    IERC721Receiver,
+    IAuction,
+    Initializable,
+    OwnableUpgradeable,
+    UUPSUpgradeable,
+    ReentrancyGuardUpgradeable
+{
     address public seller;
     // address public nftContract;
     IERC721 public nft;
@@ -45,15 +57,19 @@ contract AuctionController is IERC721Receiver, IAuction {
     event BidPlaced(address indexed bidder, uint256 amount, uint256 amountInUSD);
     event AuctionEnded(address winner, uint256 winningBidUSD);
     event AuctionCancelled();
+    event AuctionInitialized(
+        uint256 auctionID,
+        address seller,
+        address nftContract,
+        uint256 tokenId,
+        address paymentToken,
+        uint256 reservePrice,
+        uint256 startTime,
+        uint256 endTime
+    );
 
-    modifier nonReentrant() {
-        require(_status == 1, "ReentrancyGuard: reentrant call");
-        _status = 1;
-        _;
-        _status = 0;
-    }
-
-    constructor(
+    function initialize(
+        address _owner,
         uint256 _auctionID,
         address _nftContract,
         uint256 _tokenId,
@@ -63,7 +79,11 @@ contract AuctionController is IERC721Receiver, IAuction {
         uint256 _startTime,
         uint256 _endTime,
         address _router
-    ) {
+    ) public initializer {
+        __Ownable_init();
+        __UUPSUpgradeable_init();
+        __ReentrancyGuard_init();
+
         auctionID = _auctionID;
         nft = IERC721(_nftContract);
         tokenId = _tokenId;
@@ -79,6 +99,11 @@ contract AuctionController is IERC721Receiver, IAuction {
         _status = 0;
 
         router = IRouterClient(_router);
+
+        // set owner (for upgrades) to provided _owner (should be multisig/timelock)
+        transferOwnership(_owner);
+
+        emit AuctionInitialized(auctionID, seller, _nftContract, _tokenId, _bidToken, 0, _startTime, _endTime);
     }
 
     function getLastPrice() internal view returns (uint256) {
@@ -94,6 +119,9 @@ contract AuctionController is IERC721Receiver, IAuction {
 
         return (amount * price) / decials;
     }
+
+    // UUPS authorize upgrade
+    function _authorizeUpgrade(address newImpl) internal override onlyOwner {}
 
     /// @dev Handles the receipt of an NFT
     function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata data)

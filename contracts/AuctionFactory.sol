@@ -3,20 +3,35 @@ pragma solidity ^0.8.28;
 
 import "./AuctionController.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
-contract AuctionFactory {
-    mapping(uint256 => AuctionController) public deployedAuctions;
-    address public owner;
+contract AuctionFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+    address[] public allAuctions;
 
     mapping(address => mapping(uint256 => address)) public auctionContracts; // nftContract => tokenId => auctionContract
+    address public auctionImplementation;
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner can call this function");
-        _;
+    event AuctionImplUpdated(address oldImpl, address newImpl);
+    event AuctionCreated(
+        address indexed auctionProxy, address indexed seller, address indexed nftContract, uint256 tokenId
+    );
+
+    function initialize(address _owner, address _auctionImplementation) public initializer {
+        __Ownable_init();
+        __UUPSUpgradeable_init();
+        require(_auctionImplementation != address(0), "impl zero");
+        auctionImplementation = _auctionImplementation;
+        transferOwnership(_owner);
     }
 
-    constructor() {
-        owner = msg.sender;
+    function setAuctionImplementation(address _newImpl) external onlyOwner {
+        require(_newImpl != address(0), "zero");
+        address old = auctionImplementation;
+        auctionImplementation = _newImpl;
+        emit AuctionImplUpdated(old, _newImpl);
     }
 
     function createAuction(
@@ -31,27 +46,57 @@ contract AuctionFactory {
     ) external returns (address auctionAddress) {
         require(auctionContracts[nftContract][tokenId] == address(0), "Auction already exists for this NFT");
         require(IERC721(nftContract).ownerOf(tokenId) == msg.sender, "Not the owner of the NFT");
-        AuctionController newAuction = new AuctionController(
-            auctionId, nftContract, tokenId, msg.sender, bidToken, priceFeed, startTime, endTime, _router
+
+        // address _owner,
+        // uint256 _auctionID,
+        // address _nftContract,
+        // uint256 _tokenId,
+        // address _seller,
+        // address _bidToken,
+        // address _priceFeed,
+        // uint256 _startTime,
+        // uint256 _endTime,
+        // address _router
+        // build init calldata matching AuctionUpgradeable.initialize
+        bytes memory initData = abi.encodeWithSignature(
+            "initialize(address,uint256,address,uint256,address,address,address,uint256,uint256,address)",
+            owner(), // _owner -> factory owner (multisig/timelock)
+            auctionId,
+            nftContract,
+            tokenId,
+            msg.sender, // seller
+            bidToken,
+            priceFeed,
+            startTime,
+            endTime,
+            _router
         );
 
-        auctionAddress = address(newAuction);
+        // AuctionController newAuction = new AuctionController(
+        //     auctionId, nftContract, tokenId, msg.sender, bidToken, priceFeed, startTime, endTime, _router
+        // );
+        ERC1967Proxy proxy = new ERC1967Proxy(auctionImplementation, initData);
 
-        IERC721(nftContract).approve(auctionAddress, tokenId);
+        auctionAddress = address(proxy);
 
-        deployedAuctions[auctionId] = newAuction;
+        // auctionAddress = address(newAuction);
+
+        IERC721(nftContract).safeTransferFrom(msg.sender, auctionAddress, tokenId);
+
+        // IERC721(nftContract).approve(auctionAddress, tokenId);
+
+        allAuctions.push(auctionAddress);
 
         auctionContracts[nftContract][tokenId] = auctionAddress;
 
         // Transfer the NFT to the auction contract
-        IERC721(nftContract).safeTransferFrom(msg.sender, auctionAddress, tokenId);
+        // IERC721(nftContract).safeTransferFrom(msg.sender, auctionAddress, tokenId);
     }
 
-    function getDeployedById(uint256 auctionId) external view returns (AuctionController) {
-        return deployedAuctions[auctionId];
+    function allAuctionsLength() external view returns (uint256) {
+        return allAuctions.length;
     }
 
-    function setOwner(address newOwner) external onlyOwner {
-        owner = newOwner;
-    }
+    // UUPS authorize upgrade for factory itself
+    function _authorizeUpgrade(address newImpl) internal override onlyOwner {}
 }
