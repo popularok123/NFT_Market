@@ -5,7 +5,7 @@ import "./AuctionController.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
 contract AuctionFactory {
-    address[] public deployedAuctions;
+    mapping(uint256 => AuctionController) public deployedAuctions;
     address public owner;
 
     mapping(address => mapping(uint256 => address)) public auctionContracts; // nftContract => tokenId => auctionContract
@@ -20,23 +20,26 @@ contract AuctionFactory {
     }
 
     function createAuction(
+        uint256 auctionId,
         address nftContract,
         uint256 tokenId,
         address bidToken,
         address priceFeed,
         uint256 startTime,
-        uint256 endTime
+        uint256 endTime,
+        address _router
     ) external returns (address auctionAddress) {
         require(auctionContracts[nftContract][tokenId] == address(0), "Auction already exists for this NFT");
         require(IERC721(nftContract).ownerOf(tokenId) == msg.sender, "Not the owner of the NFT");
-        AuctionController newAuction =
-            new AuctionController(nftContract, tokenId, msg.sender, bidToken, priceFeed, startTime, endTime);
+        AuctionController newAuction = new AuctionController(
+            auctionId, nftContract, tokenId, msg.sender, bidToken, priceFeed, startTime, endTime, _router
+        );
 
         auctionAddress = address(newAuction);
 
         IERC721(nftContract).approve(auctionAddress, tokenId);
 
-        deployedAuctions.push(auctionAddress);
+        deployedAuctions[auctionId] = newAuction;
 
         auctionContracts[nftContract][tokenId] = auctionAddress;
 
@@ -44,8 +47,8 @@ contract AuctionFactory {
         IERC721(nftContract).safeTransferFrom(msg.sender, auctionAddress, tokenId);
     }
 
-    function getDeployedAuctions() external view returns (address[] memory) {
-        return deployedAuctions;
+    function getDeployedById(uint256 auctionId) external view returns (AuctionController) {
+        return deployedAuctions[auctionId];
     }
 
     function setOwner(address newOwner) external onlyOwner {

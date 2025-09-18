@@ -5,8 +5,11 @@ import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {IRouterClient} from "@chainlink/contracts-ccip/contracts/interfaces/IRouterClient.sol";
+import {Client} from "@chainlink/contracts-ccip/contracts/libraries/Client.sol";
+import {IAuction} from "./IAuction.sol";
 
-contract AuctionController is IERC721Receiver {
+contract AuctionController is IERC721Receiver, IAuction {
     address public seller;
     // address public nftContract;
     IERC721 public nft;
@@ -34,6 +37,11 @@ contract AuctionController is IERC721Receiver {
 
     uint256 private _status;
 
+    IRouterClient public router;
+    address public ccipReceiver;
+
+    uint256 private auctionID;
+
     event BidPlaced(address indexed bidder, uint256 amount, uint256 amountInUSD);
     event AuctionEnded(address winner, uint256 winningBidUSD);
     event AuctionCancelled();
@@ -46,14 +54,17 @@ contract AuctionController is IERC721Receiver {
     }
 
     constructor(
+        uint256 _auctionID,
         address _nftContract,
         uint256 _tokenId,
         address _seller,
         address _bidToken,
         address _priceFeed,
         uint256 _startTime,
-        uint256 _endTime
+        uint256 _endTime,
+        address _router
     ) {
+        auctionID = _auctionID;
         nft = IERC721(_nftContract);
         tokenId = _tokenId;
         seller = _seller;
@@ -66,6 +77,8 @@ contract AuctionController is IERC721Receiver {
         factory = msg.sender; //factory address
 
         _status = 0;
+
+        router = IRouterClient(_router);
     }
 
     function getLastPrice() internal view returns (uint256) {
@@ -125,6 +138,51 @@ contract AuctionController is IERC721Receiver {
         highestBidUSD = bidInUSD;
 
         emit BidPlaced(msg.sender, amount, bidInUSD);
+    }
+
+    function placeBidFromCrossChain(
+        uint256 auctionId,
+        address bidder,
+        address token,
+        uint256 amount,
+        uint64 sourceChainSelector
+    ) external {
+        require(msg.sender == address(router), "Only router can call");
+        require(block.timestamp < endTime, "Auction ended");
+
+        uint256 bidInUSD = ToUSD(amount);
+        require(bidInUSD > highestBidUSD, "Bid too low");
+
+        if (highestBidder != address(0)) {
+            _sendCrossChainRefund(sourceChainSelector, highestBidder, token, bids[highestBidder]);
+        }
+
+        bids[bidder] = amount;
+        highestBidder = bidder;
+        highestBidUSD = bidInUSD;
+
+        emit BidPlaced(bidder, amount, bidInUSD);
+    }
+
+    function _sendCrossChainRefund(uint64 _destChainSelector, address _receiver, address _token, uint256 _amount)
+        internal
+    {
+        Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);
+        tokenAmounts[0] = Client.EVMTokenAmount({token: _token, amount: _amount});
+
+        bytes memory payload = abi.encode(_receiver, _token, _amount);
+
+        Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
+            receiver: abi.encode(_receiver),
+            data: payload,
+            tokenAmounts: tokenAmounts,
+            feeToken: _token,
+            extraArgs: Client._argsToBytes(Client.EVMExtraArgsV1({gasLimit: 300000}))
+        });
+
+        uint256 fee = router.getFee(_destChainSelector, message);
+
+        router.ccipSend{value: fee}(_destChainSelector, message);
     }
 
     function endAuction() external nonReentrant {
